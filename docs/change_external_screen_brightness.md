@@ -16,6 +16,8 @@ When you attach an external display to an Ubuntu laptop, the keyboard command on
 
 # Change brightness for Wayland (does not support xrandr) 
 
+## The infor below can be found [here](https://fostips.com/ddcbc-gtk-control-brightness-ddc-ci-monitors/)
+
 ddcutil needs to be installed : 
 
 ` sudo apt install ddcutil`
