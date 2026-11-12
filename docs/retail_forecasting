@@ -1,0 +1,395 @@
+# Proposition technique – Évolution du moteur de prévision ADEO (Lots 1, 2, 3)
+
+11 novembre 2026 · Deniz Pekin
+
+## Synthèse
+
+Nous proposons de faire évoluer le moteur de prévision existant en un modèle de demande qui estime une **espérance conditionnelle de la demande non censurée**, réagit au prix de façon contrôlée, et alimente un moteur de scénarios (cannibalisation puis halo) dont les volumes se conservent. Le moteur actuel d'ADEO reste la baseline de toutes les comparaisons.
+
+Quatre partis pris scientifiques structurent la proposition :
+
+- **La fonction de perte découle de la décision, pas de l'habitude.** Une métrique de type WAPE est minimisée par la médiane, qui vaut zéro pour la plupart des slow movers. Le modèle de base estime donc une moyenne (perte Tweedie ou Poisson, lien log) ; les quantiles sont estimés à part pour le stock de sécurité ; le WapeCA reste la métrique contractuelle, lue avec ce biais en tête.
+- **Un seul modèle global, appris sur toutes les séries**, plutôt qu'un modèle par série. Les slow movers apprennent des produits voisins ; Croston, SBA et TSB restent des baselines.
+- **Une élasticité est un paramètre causal**, pas une dépendance partielle. Elle est identifiée sur les variations de prix exogènes, débiaisée par orthogonalisation (double machine learning) et stabilisée par mutualisation hiérarchique.
+- **Les scénarios portent sur des espérances**, seules additives : la somme des transferts de cannibalisation ne dépasse jamais le volume perdu, et le halo ne s'applique qu'à la variation nette du produit principal.
+
+Les trois lots forment une seule chaîne : socle de données dbt → prévision de base (Lot 1) → élasticités propres et croisées, cannibalisation (Lot 2) → halo (Lot 3) → table BigQuery de volumes décomposés.
+
+## 1. Formulation statistique du problème
+
+La cible est la demande latente D(s,i,t), pas les ventes observées. On observe Y = min(D, stock disponible) : chaque semaine en rupture est une observation **censurée à droite**, pas un zéro.
+
+**Granularité.** Magasin × référence × semaine, à confirmer en cadrage avec les horizons. Les agrégats famille et BU sont obtenus par somme des espérances (bottom-up), cohérents par construction ; une réconciliation MinT est proposée en option si le niveau famille est mieux prévu directement.
+
+**Ce que le modèle estime.** Pour un horizon h et l'information F connue à la date d'origine T :
+
+```math
+\mu_{s,i,T+h} = \mathbb{E}\left[ D_{s,i,T+h} \mid \mathcal{F}_T,\ x^{\text{plan}}_{s,i,T+h} \right]
+```
+
+x^plan regroupe ce qui est connu sur l'horizon : prix et promotions planifiés, calendrier. Les prix concurrents et les stocks futurs ne le sont pas ; on les fige à leur dernière valeur connue ou on les traite en scénario.
+
+**Pourquoi l'espérance et pas la médiane.** Trois raisons :
+
+- l'espérance est additive : la somme des prévisions magasin × référence donne la prévision famille, ce qui est faux pour les médianes et les quantiles ;
+- les Lots 2 et 3 déplacent des volumes entre produits ; la conservation (Σ transferts ≤ volume perdu) n'a de sens que sur des espérances ;
+- une élasticité se définit sur l'espérance : ∂ log μ / ∂ log p.
+
+La distribution prédictive reste utile au réapprovisionnement : elle est fournie par des quantiles (§ 2.3), pas par la prévision ponctuelle.
+
+**Traitement de la censure.** Trois niveaux, choisis selon la qualité des données de stock :
+
+1. **Masque** : les semaines en rupture (stock nul en début ou fin de période, ou rupture reconstituée) sont exclues de la perte d'apprentissage. Simple et sans biais si la rupture ne dépend pas de la demande non observée, hypothèse fausse en période de forte demande.
+2. **Rupture partielle** : sur une semaine rompue à mi-période, on rééchelonne par la fraction de jours en stock, ou on garde l'observation avec la disponibilité en feature.
+3. **Vraisemblance censurée** (option) : pour les observations censurées, la contribution à la vraisemblance est P(D ≥ y), via un objectif personnalisé LightGBM (gradient et hessienne de la log-survie Poisson). À réserver aux familles où les ruptures sont fréquentes et bien tracées.
+
+La censure a un effet sur le Lot 2 : une rupture du produit A génère de vraies ventes de substitution sur B. Si on l'ignore, la demande de B est surestimée et la cannibalisation estimée sur les prix est biaisée. La disponibilité des substituts entre donc en variable de contrôle.
+
+## 2. Fonctions de perte et métriques
+
+Chaque perte a un minimiseur précis ; on choisit la perte d'apprentissage selon la quantité voulue, et les métriques d'évaluation en sachant ce qu'elles récompensent.
+
+### 2.1 Ce que chaque perte estime
+
+| Perte | Prévision optimale | Usage dans le projet |
+| --- | --- | --- |
+| Quadratique (L2) | Moyenne conditionnelle | Fast movers à fort volume, en alternative ; sensible aux gros vendeurs et aux commandes pro |
+| Absolue (L1), WAPE, MAE | Médiane conditionnelle | Évaluation uniquement ; piège sur l'intermittent (§ 2.2) |
+| Pinball au niveau q | Quantile q | Stocks de sécurité (option) |
+| Déviance de Poisson, lien log | Moyenne conditionnelle | Fast movers, modèle principal |
+| Déviance de Tweedie (1 < p < 2), lien log | Moyenne conditionnelle | Slow et intermittents, modèle principal |
+| MAPE | Biaisée vers le bas, indéfinie si y = 0 | Écartée |
+
+### 2.2 Le piège du WAPE sur les slow movers
+
+Le WapeCA, métrique contractuelle, s'écrit avec p le prix de vente :
+
+```math
+\mathrm{WAPE}_{CA} = \frac{\sum_{s,i,t} p_{s,i,t}\, \lvert y_{s,i,t} - \hat{y}_{s,i,t} \rvert}{\sum_{s,i,t} p_{s,i,t}\, y_{s,i,t}}
+```
+
+C'est une erreur absolue pondérée, divisée par une constante. Série par série, elle est minimisée par la **médiane** (pondérée) de la demande. Dès que P(Y = 0) > 0,5, la prévision optimale au sens du WAPE est zéro.
+
+Exemple : une référence vend 1 unité avec une probabilité de 0,3 par semaine. Erreur absolue attendue par semaine :
+
+| Prévision | E\|Y − ŷ\| | Biais | Conséquence stock |
+| --- | --- | --- | --- |
+| 1 (plancher actuel) | 0,70 | +233 % | Surstock systématique |
+| 0,3 (espérance, Tweedie) | 0,42 | 0 % | Correct en moyenne |
+| 0 (médiane) | 0,30 | −100 % | Rupture garantie, déréférencement de fait |
+
+Le WAPE préfère donc la pire décision. Deux conséquences pour la méthode :
+
+- on n'entraîne jamais sur une perte L1 pour l'intermittent, et on ne sélectionne pas les hyperparamètres sur le seul WapeCA ;
+- le WapeCA est toujours lu avec le **biais** et une métrique orientée moyenne (RMSSE). Une baisse du WapeCA accompagnée d'un biais négatif est un recul, pas un progrès.
+
+Ce piège explique peut-être l'existence du plancher actuel : un modèle sélectionné sur une métrique de type L1 dérive vers zéro, et le plancher compense. La suppression du plancher passe donc aussi par le changement de métrique de sélection.
+
+Le même raisonnement écarte le MASE pour l'intermittent : il est fondé sur l'erreur absolue et récompense aussi la prévision nulle. On lui préfère le RMSSE (erreur quadratique rapportée à celle de la prévision naïve, métrique du M5), dont l'optimum est la moyenne.
+
+### 2.3 Pertes d'apprentissage retenues
+
+**Tweedie.** Pour 1 < p < 2, la loi de Tweedie est un Poisson composé de Gamma : une masse en zéro et une partie continue positive, avec Var(Y) = φ μ^p. La déviance unitaire minimisée est :
+
+```math
+d(y,\mu) = 2\left[ \frac{y^{2-p}}{(1-p)(2-p)} - \frac{y\,\mu^{1-p}}{1-p} + \frac{\mu^{2-p}}{2-p} \right]
+```
+
+Avec le lien log, le score brut de LightGBM est log μ : les effets des features sont multiplicatifs, ce qui est cohérent avec une élasticité lue comme une dérivée en log.
+
+**Poisson pour les fast movers.** La déviance de Poisson donne un estimateur convergent de la moyenne même si les données sont surdispersées (propriété de quasi-vraisemblance) : seule la variance est mal spécifiée, ce qui n'affecte pas la prévision ponctuelle.
+
+**Réglage de p.** Les déviances calculées pour des p différents ne sont pas comparables entre elles. On choisit donc p (grille 1,1 à 1,5, par segment) sur une métrique fixe de validation : RMSSE et biais, puis WapeCA en contrôle.
+
+**Pondération.** Pondérer chaque observation par le prix rapproche l'apprentissage du WapeCA et concentre l'effort sur le chiffre d'affaires. On teste ce poids comme un hyperparamètre, en vérifiant qu'il ne dégrade pas le biais de la longue traîne.
+
+**Quantiles (option).** La perte pinball de LightGBM fonctionne mal sur des comptages faibles : quantiles bas collés à zéro, croisements entre quantiles. Pour les slow movers, on dérive plutôt les quantiles d'une loi binomiale négative de moyenne μ (modèle) et de dispersion estimée par segment : quantiles cohérents, sans croisement. Le calibrage est vérifié par la couverture des intervalles et un histogramme PIT randomisé (adapté aux données discrètes).
+
+### 2.4 Tableau de bord d'évaluation
+
+| Métrique | Ce qu'elle mesure | Lecture |
+| --- | --- | --- |
+| WapeCA | Précision pondérée par le chiffre d'affaires | Métrique contractuelle, globale et par BU |
+| Biais en volume, Σ(ŷ − y) / Σy | Sur- ou sous-prévision | Pilote surstock et rupture ; par segment |
+| RMSSE | Erreur quadratique rapportée à la naïve | Métrique principale de l'intermittent |
+| WAPE en volume | Précision non pondérée | Contrôle de la longue traîne |
+| Pinball échelonnée, couverture | Qualité des quantiles | Si l'option quantiles est retenue |
+| Erreur d'uplift promotionnel | Réponse du modèle au prix | Validation des élasticités (§ 4, § 7) |
+
+Toutes les métriques sont calculées hors semaines de rupture, la demande y étant inconnue.
+
+## 3. Lot 1 – Modèles de prévision fast / slow
+
+Le Lot 1 remplace la prévision plancher par deux modèles LightGBM globaux, routés par segment de demande, avec des pertes adaptées à chaque segment.
+
+### 3.1 Segmentation
+
+Classification de Syntetos–Boylan au niveau magasin × référence, calculée hors semaines de rupture sur une fenêtre glissante de 52 semaines :
+
+```math
+\mathrm{ADI} = \frac{\text{nombre de périodes}}{\text{nombre de périodes avec vente}}, \qquad \mathrm{CV}^2 = \left( \frac{\sigma_{y \mid y>0}}{\mu_{y \mid y>0}} \right)^2
+```
+
+Seuils de référence ADI = 1,32 et CV² = 0,49, recalibrés sur ADEO. Une hystérésis évite qu'une série change de modèle à chaque recalcul.
+
+La segmentation est une hypothèse à tester, pas un dogme : on compare le routage par segment à un modèle unique Tweedie qui reçoit le segment en feature. On garde la segmentation seulement si elle gagne sur le backtest.
+
+### 3.2 Modèles
+
+| Segment | Modèle principal | Alternative testée | Baselines |
+| --- | --- | --- | --- |
+| Fast (lisse, erratique) | LightGBM global, déviance de Poisson | Tweedie p ≈ 1,1 ; L2 sur volumes | Modèle ADEO actuel, naïf saisonnier N-1, ETS |
+| Slow (intermittent, grumeleux) | LightGBM global, déviance de Tweedie, p réglé entre 1,1 et 1,5 | Modèle hurdle | Modèle ADEO actuel, Croston, SBA, TSB |
+
+**Modèle hurdle.** Il sépare l'occurrence de la quantité :
+
+```math
+\mathbb{E}[Y \mid x] = \pi(x) \times m(x), \quad \pi(x) = P(Y>0 \mid x), \quad m(x) = \mathbb{E}[Y \mid Y>0, x]
+```
+
+π est un classifieur (log-loss) ; m est appris sur les seules semaines avec vente, avec une perte de Poisson tronquée en zéro ou Gamma. Comme μ est un produit, l'étalonnage de π compte : on le vérifie (courbe de fiabilité) et on le corrige si besoin par régression isotone. On n'apprend pas m sur log(y) : la retransformation exp(E[log y]) sous-estime la moyenne.
+
+**Pourquoi un modèle global.** Une référence qui vend trois fois par an n'a pas assez de données pour estimer seule sa saisonnalité ou son effet prix. Le modèle global partage ces effets entre références d'une même famille, magasins d'un même cluster, et séries de volumes comparables.
+
+### 3.3 Stratégie multi-horizon
+
+On retient la stratégie **directe** : l'horizon est une feature (ou un modèle par tranche d'horizon), et chaque lag est au moins égal à l'horizon prévu. La stratégie récursive propage l'erreur d'une semaine à l'autre et rend les scénarios prix difficiles à interpréter, car le choc se propage par les lags.
+
+### 3.4 Variables explicatives
+
+| Famille | Exemples | Point d'attention |
+| --- | --- | --- |
+| Historique | Lags ≥ h, moyennes et parts de semaines avec vente sur 4, 13, 52 semaines | Calculés hors ruptures |
+| Prix propre | Prix relatif au prix de référence (médiane glissante 13 semaines), profondeur de promotion, ancienneté du dernier changement | Contraintes de monotonie (§ 4.3) |
+| Position interne | Rang et écart à la médiane de la famille ; niveau MN / MDH / premier prix | Même famille d'usage et unité de mesure |
+| Concurrence | Indice de prix concurrent, écart en % | Inconnu sur l'horizon : dernière valeur ou scénario |
+| Promotion | Mécanique, support, promo en t − 1 et t + 1 | Capte le creux avant et après promotion (report d'achat, stockage) |
+| Calendrier | Semaine de l'année, fêtes mobiles, vacances par région, temps forts | Paramétré par BU |
+| Cycle de vie | Âge de la référence, semaines avant déréférencement connu | Nouveautés : analogues du Lot 2 |
+| Disponibilité | Taux de jours en stock du produit et de ses substituts | Disponibilité future = scénario nominal |
+| Hiérarchie | Encodages cibles famille, magasin, cluster | Calculés dans des plis temporels pour éviter la fuite |
+| Externe (option) | Météo pour jardin et chauffage | Prévisions météo à l'horizon, pas valeurs observées |
+
+### 3.5 Suppression du plancher
+
+Le plancher max(ŷ, 1) multiplie la prévision d'un produit vendu une fois toutes les 10 semaines par environ 10. On commence par identifier sa raison d'être : censure non traitée, métrique de sélection de type L1 (§ 2.2), contrainte d'un outil aval, ou stock minimum en rayon. Chaque cause a son correctif ; le stock de présentation relève du réapprovisionnement, pas de la prévision. Livrable : prévisions nulles autorisées, négatives impossibles (lien log), tests de non-régression et accord des consommateurs aval.
+
+## 4. Lot 1 – Élasticité prix propre
+
+L'élasticité est estimée comme un paramètre causal, séparément du modèle de prévision, puis appliquée aux scénarios. Le modèle de prévision reste le meilleur outil pour prévoir au prix planifié ; il n'est pas le bon outil pour dire ce qui se passe à un autre prix.
+
+### 4.1 Le problème d'identification
+
+Une corrélation prix–volume dans l'historique ne mesure pas l'élasticité, pour quatre raisons :
+
+- **endogénéité** : les promotions sont placées sur les semaines de forte demande attendue (printemps jardin), ce qui gonfle l'effet apparent ;
+- **traitements groupés** : une promotion combine baisse de prix, prospectus et mise en avant ; l'effet du seul prix est confondu ;
+- **faible variation hors promotion** : les prix permanents bougent peu, l'information vient surtout de quelques épisodes ;
+- **effets dynamiques** : report d'achat avant la promotion, creux après ; une fenêtre trop courte surestime l'effet net.
+
+Une courbe SHAP ou de dépendance partielle de LightGBM hérite de tous ces biais : c'est une description du modèle, pas un effet causal.
+
+### 4.2 Estimation
+
+**Modèle de référence log-log**, au niveau famille × cluster de magasins × semaine, avec contrôles explicites :
+
+```math
+\log q_{i,c,t} = \alpha_{i,c} + \varepsilon_{ii} \log \frac{p_{i,c,t}}{p^{\text{ref}}_{i,c,t}} + \beta^\top \text{promo}_{i,c,t} + \gamma^\top z_{c,t} + s(t) + u_{i,c,t}
+```
+
+Le prix est rapporté à un prix de référence (médiane glissante), les mécaniques promotionnelles (prospectus, tête de gondole) sont des variables séparées, z regroupe disponibilité, prix concurrent et calendrier.
+
+**Double machine learning** (Chernozhukov et al.) pour lever le biais des contrôles mal spécifiés. On estime deux modèles LightGBM de nuisance, puis on régresse les résidus :
+
+```math
+\tilde{q} = \log q - \hat{\mathbb{E}}[\log q \mid X], \qquad \tilde{p} = \log p - \hat{\mathbb{E}}[\log p \mid X], \qquad \hat{\varepsilon} = \frac{\sum \tilde{p}\, \tilde{q}}{\sum \tilde{p}^{2}}
+```
+
+L'estimateur est orthogonal : une erreur de premier ordre sur les modèles de nuisance ne biaise pas ε au premier ordre. Le cross-fitting se fait par blocs temporels, jamais en pli aléatoire, pour éviter la fuite entre semaines voisines. La variation résiduelle du prix vient alors des décisions non expliquées par X (profondeur de promotion, changements permanents), utilisées comme expériences naturelles.
+
+**Mutualisation hiérarchique.** Les élasticités par famille sont rétrécies vers celle du rayon (modèle bayésien hiérarchique, ou effets aléatoires) : une famille avec peu d'épisodes promotionnels hérite de l'information de ses voisines au lieu de produire une estimation instable.
+
+**Contrôles de plausibilité.** Élasticité propre négative ; ordre de grandeur comparé à la littérature (moyenne d'environ −2,6 dans la méta-analyse de Bijmolt, van Heerde et Pieters, 2005) et aux attentes du métier par famille ; élasticités promotionnelles et permanentes distinguées, car la seconde est en général plus faible.
+
+### 4.3 Articulation avec LightGBM
+
+Deux rôles distincts :
+
+- **Prévision au prix planifié** : LightGBM, avec les features prix. Les features qui contiennent le prix propre portent une contrainte de monotonie décroissante (méthode advanced). Attention : la contrainte porte feature par feature. Si le prix propre entre aussi dans un rang, un écart à la concurrence et un ratio de gamme sans contrainte, la réponse totale n'est pas monotone. Toutes ces features sont donc contraintes dans le même sens, ou dérivées d'un seul prix relatif.
+- **Réponse à un scénario** : appliquée de façon multiplicative à la prévision de base, avec l'élasticité estimée en 4.2 :
+
+```math
+\mu^{\text{scén}}_{i} = \mu^{\text{base}}_{i} \times \left( \frac{p^{\text{scén}}_{i}}{p^{\text{base}}_{i}} \right)^{\hat{\varepsilon}_{ii}}
+```
+
+Cette séparation donne des réponses lisses (pas d'escalier d'arbre), interprétables et sans extrapolation hors du support des données. On compare l'élasticité implicite de LightGBM (différence finie de log μ à ±5 % et ±10 %) à l'estimation causale : un écart important signale un problème de confusion dans le modèle de prévision. Les scénarios qui sortent de la plage de prix observée sont signalés comme extrapolés.
+
+### 4.4 Validation des élasticités
+
+La seule validation directe est prédictive : on retire de l'apprentissage un ensemble de promotions passées, on prédit leur uplift avec les élasticités estimées sans elles, et on compare à l'uplift observé, par tranche de profondeur de remise et par famille. L'effet net est mesuré sur une fenêtre qui inclut les semaines avant et après la promotion.
+
+## 5. Lot 2 – Cannibalisation MN, MDH et premier prix
+
+La cannibalisation est modélisée par des taux de détournement (diversion ratios) contraints, estimés à un niveau agrégé et validés sur des épisodes réels de promotion et de rupture.
+
+### 5.1 Structure de substitution : knowledge graph ou proximité
+
+Le graphe d'ADEO et l'algorithme de proximité sont comparés sur les mêmes familles pilotes, selon deux critères :
+
+- **validation métier** : précision et rappel sur des paires de substituts étiquetées par les experts ;
+- **validation comportementale** : une rupture du produit A est une expérience naturelle. Si B est un vrai substitut, ses ventes augmentent pendant la rupture de A, toutes choses égales par ailleurs. Ce test mesure directement la substitution, sans hypothèse sur le prix.
+
+Le choix (graphe, proximité ou hybride) est arbitré avec ADEO sur ces deux mesures. Il fixe l'ensemble des substituts S(i) de chaque produit, ce qui réduit fortement le nombre de paramètres croisés à estimer.
+
+### 5.2 Deux modèles comparés
+
+**A. Log-log contraint.** Pour chaque famille × cluster de magasins, une matrice 3 × 3 d'élasticités entre les niveaux MN, MDH et premier prix, soit 9 paramètres. Contraintes : εᵢᵢ ≤ 0 ; εᵢⱼ ≥ 0 entre substituts. Estimation par pseudo-maximum de vraisemblance de Poisson (PPML), qui accepte les volumes nuls, avec mutualisation hiérarchique entre familles. Simple et lisible, mais rien ne garantit la cohérence des transferts pour de fortes variations.
+
+**B. Logit emboîté (nested logit).** Chaque client du magasin choisit un produit de la famille ou l'option extérieure (acheter ailleurs, ne pas acheter). Les nids regroupent les produits d'un même usage :
+
+```math
+s_j = \frac{e^{\delta_j/\lambda} D_g^{\lambda - 1}}{1 + \sum_{h} D_h^{\lambda}}, \qquad D_g = \sum_{k \in g} e^{\delta_k / \lambda}, \qquad \delta_j = \xi_j - \alpha\, p_j + \gamma^\top z_j
+```
+
+L'option extérieure donne directement les ventes perdues ; la somme des transferts est inférieure au volume perdu par construction ; λ ∈ ]0, 1] mesure la corrélation dans un nid et corrige l'hypothèse IIA du logit simple. Point délicat : la taille de marché (qui définit la part extérieure) n'est pas observée. On la paramètre comme un multiple du volume maximal de la famille et on teste la sensibilité des élasticités à ce choix.
+
+Le modèle retenu est celui qui prédit le mieux, hors échantillon, la baisse des substituts lors des promotions et ruptures retenues pour la validation. Notre hypothèse de départ : A pour les petites variations, B dès que les scénarios dépassent environ 15 % de variation de prix.
+
+### 5.3 Taux de détournement et conservation
+
+Le taux de détournement du produit i vers j est la part du volume perdu par i qui se reporte sur j :
+
+```math
+D_{i \to j} = -\frac{\partial q_j / \partial p_i}{\partial q_i / \partial p_i} = \frac{\varepsilon_{ji}\, q_j}{-\varepsilon_{ii}\, q_i}, \qquad D_{i \to j} \ge 0, \qquad \sum_{j \in S(i)} D_{i \to j} \le 1
+```
+
+Si les estimations du modèle A violent ces contraintes, elles sont projetées sur l'ensemble admissible, et la violation est remontée comme un signal de mauvaise identification. 1 − Σ D est la part de l'effet qui vient de l'extérieur du magasin ou d'une expansion de la catégorie.
+
+### 5.4 Moteur de scénarios
+
+Pour une variation de prix du produit pivot i (par exemple −10 %) :
+
+1. variation propre : Δqᵢ = μᵢ^base × ((pᵢ^scén / pᵢ^base)^εᵢᵢ − 1) ;
+2. transferts : Δqⱼ = −Dᵢ→ⱼ × Δqᵢ pour chaque substitut j ;
+3. bornes : aucun volume final négatif, aucun transfert supérieur à la variation du pivot ;
+4. sortie : volume net par produit, décomposé en effet propre et cannibalisation.
+
+Si plusieurs prix changent à la fois, on utilise le modèle B, qui traite les changements simultanés de façon cohérente, plutôt que d'additionner des effets linéarisés.
+
+### 5.5 Recette
+
+50 scénarios (nominaux, cas limites, absence de substitut, variations extrêmes, ruptures simultanées) avec contrôles automatiques : signes, somme des transferts, volumes non négatifs, symétrie de Slutsky approchée en contrôle de vraisemblance, et comparaison aux épisodes historiques comparables.
+
+## 6. Lot 3 – Effet halo sur les accessoires
+
+Le halo est un post-traitement qui ajoute à l'accessoire un volume proportionnel à la **variation nette** de ses produits principaux, avec un taux d'attachement incrémental, étalonné sur les promotions passées.
+
+### 6.1 Formule
+
+Pour un accessoire a, un magasin s et une période t, avec P(a) les produits principaux liés à a :
+
+```math
+H_{a,s,t} = \sum_{m \in P(a)} \tau^{\text{incr}}_{m \to a,\, s} \left( V^{\text{scén,net}}_{m,s,t} - V^{\text{base}}_{m,s,t} \right)
+```
+
+```math
+V^{\text{final}}_{a,s,t} = \max\left(0,\ V^{\text{base}}_{a,s,t} + \Delta^{\text{propre}}_{a,s,t} + \Delta^{\text{cannib}}_{a,s,t} + H_{a,s,t}\right)
+```
+
+Sans scénario, la variation est nulle et le halo aussi : la prévision de base de l'accessoire contient déjà ses ventes attachées habituelles. Appliquer τ au volume total du produit principal compterait ces ventes deux fois. Exemple : 100 perceuses, 50 boîtes de forets dont 30 attachées ; la formule totale donnerait 50 + 30 = 80, la formule incrémentale donne 50 tant que le prix ne change pas, puis 50 + (120 − 100) × 0,30 = 56 si une promotion porte les perceuses à 120.
+
+### 6.2 Taux d'attachement : moyen, incrémental, rétréci
+
+**Taux moyen** sur les tickets : unités de a achetées dans un panier contenant m, rapportées aux unités de m. Il décrit le client habituel.
+
+**Taux incrémental.** Le client attiré par une promotion n'est pas le client moyen : un acheteur opportuniste achète souvent moins d'accessoires. On estime donc τ^incr comme la pente du volume d'accessoire sur le volume du produit principal pendant les promotions passées de m, en contrôlant le prix et les promotions propres de a :
+
+```math
+\tau^{\text{incr}}_{m \to a} = \frac{\Delta A}{\Delta M} \quad \text{(épisodes promotionnels de } m\text{, hors promotion sur } a)
+```
+
+**Rétrécissement.** Au niveau magasin, les comptages sont faibles. On utilise un estimateur bayésien empirique Gamma–Poisson qui tire le taux du magasin vers celui de son cluster, avec κ réglé par maximum de vraisemblance marginale :
+
+```math
+\hat{\tau}_{s} = \frac{A_s + \kappa\, \hat{\tau}_{\text{cluster}}}{M_s + \kappa}
+```
+
+Le taux incrémental, plus bruité, est lui-même rétréci vers le taux moyen quand les épisodes promotionnels sont rares.
+
+### 6.3 Règles de calcul
+
+- **Cannibalisation d'abord, halo ensuite.** Si une perceuse premier prix prend des ventes à une perceuse MN, la variation nette de la famille est faible ; chaque produit principal propage sa propre variation avec son propre τ.
+- **Un seul niveau de propagation.** Pas de cascade, pas de cycle A → B → A, pas d'auto-relation.
+- **Additivité.** Un accessoire lié à plusieurs produits principaux reçoit la somme de leurs contributions ; cela suppose qu'un même panier n'est pas compté deux fois, ce qui est vérifié sur les tickets (paniers contenant deux produits principaux liés au même accessoire).
+- **Incertitude.** Un intervalle est fourni par bootstrap sur les épisodes ayant servi à estimer τ.
+
+### 6.4 Validation
+
+Recette sur 3 familles pilotes : test unitaire du double comptage (exemple ci-dessus), backtest sur les promotions retenues pour la validation (volume d'accessoire prédit contre observé pendant la promotion du produit principal), et contrôle que base + halo reste dans la plage des ventes historiques d'accessoires lors d'épisodes comparables.
+
+## 7. Protocole de validation et d'acceptation
+
+Un modèle n'est retenu que s'il bat le moteur actuel d'ADEO sur des critères fixés avant de voir les résultats, sur un backtest chronologique, avec un écart statistiquement significatif.
+
+1. **Critères figés en cadrage.** Métriques, seuils d'acceptation, périmètre (familles, magasins, horizons) et masque de rupture sont écrits et validés par ADEO avant le premier backtest. On évite ainsi de choisir après coup la métrique qui arrange.
+2. **Reproduction de la baseline.** Le moteur actuel est rejoué sur les mêmes origines ; tant qu'on ne reproduit pas ses métriques connues, aucune comparaison n'est faite.
+3. **Backtest à origine glissante.** Plusieurs dates d'origine (6 à 8, à confirmer) réparties sur 12 à 18 mois, incluant le printemps jardin et Black Friday. À chaque origine T : apprentissage sur les données ≤ T, prévision de T + 1 à T + H, toutes les features reconstruites « telles que connues en T » (jointures point-in-time dans dbt).
+4. **Réglage imbriqué.** Hyperparamètres (dont p de Tweedie) et arrêt précoce sont réglés sur un pli de validation interne, antérieur à T. Les périodes de test ne servent jamais au réglage.
+5. **Comparaison appariée.** Candidat et baseline sont évalués sur exactement les mêmes cellules magasin × référence × semaine.
+6. **Significativité.** Intervalle de confiance de l'écart de WapeCA par bootstrap apparié par blocs de semaines (les erreurs sont autocorrélées dans le temps et corrélées entre magasins) ; test de Diebold–Mariano avec variance HAC en complément, par segment.
+7. **Analyse stratifiée.** Par segment, famille, BU, décile de chiffre d'affaires, horizon, semaines avec et sans promotion. Un gain global qui cache une dégradation sur un segment important n'est pas accepté sans arbitrage.
+8. **Validation des scénarios.** Élasticités, cannibalisation et halo sont validés sur les épisodes de promotion et de rupture mis de côté (§ 4.4, 5.2, 6.4) : c'est la seule preuve qu'ils répondent correctement à un changement de prix.
+9. **Décision.** Rapport de validation et décision documentée : mise en production, ajustement ou rejet.
+
+## 8. Déroulé, industrialisation et risques
+
+Le projet suit l'ordre de la chaîne de calcul ; chaque phase se termine par une décision go / no-go validée avec ADEO.
+
+```mermaid
+flowchart TD
+    A["<b>Socle de données (dbt, BigQuery)</b><br/>Nettoyage, ruptures marquées, successions produit<br/>Features point-in-time partagées par les trois lots"]
+    B["<b>Lot 1 · Prévision de base au prix planifié</b><br/>LightGBM global : Poisson (fast), Tweedie (slow)<br/>Espérance de la demande non censurée, sans plancher"]
+    C["<b>Lots 1 et 2 · Élasticités et cannibalisation</b><br/>Double ML, mutualisation hiérarchique, nested logit<br/>Delta propre et transferts, somme des détournements ≤ 1"]
+    D["<b>Lot 3 · Halo sur les accessoires</b><br/>Taux d'attachement incrémental, rétréci par cluster<br/>Appliqué à la variation nette du produit principal"]
+    E["<b>Restitution : table BigQuery de volumes décomposés</b><br/>Base + delta propre + cannibalisation + halo, borné à zéro<br/>Consommée par les outils pricing et BI d'ADEO"]
+    A --> B --> C --> D --> E
+    style E stroke-width:2px
+```
+
+Le halo s'applique après la cannibalisation, et seule la dernière étape écrit les volumes consommés en aval.
+
+### 8.1 Phases
+
+1. **Cadrage** : accès IAM et BigQuery, reproduction du moteur actuel, critères d'acceptation figés, définition écrite de « LightGBM dual », audits du knowledge graph, du flux de prix concurrents et des données tickets.
+2. **Socle dbt** : staging, tests de qualité, marquage des ruptures, table de succession produit, features point-in-time.
+3. **Lot 1, prévision** : fast movers puis slow movers, backtest contre la baseline, suppression du plancher avec les consommateurs aval.
+4. **Lot 1, élasticités propres** : estimation, validation sur promotions mises de côté.
+5. **Lot 2** : arbitrage graphe / proximité, élasticités croisées, moteur de scénarios, recette des 50 scénarios.
+6. **Lot 3** : taux d'attachement, post-traitement halo, recette sur 3 familles.
+7. **Industrialisation 5 BU** : paramétrage par BU, tests d'intégration, PV de recette.
+
+Les durées sont fixées en fin de cadrage, une fois connues la qualité des données et la disponibilité des sources.
+
+### 8.2 Industrialisation
+
+Extension de la stack existante, sans nouvel orchestrateur : pipeline ZenML (extraction BigQuery, features dbt, entraînement par segment, évaluation, enregistrement), Vertex AI Model Registry, scoring batch écrit dans BigQuery, CI/CD avec pytest et dbt tests. La supervision suit la dérive des features (PSI), les métriques par segment, la part de prévisions proches de zéro, les changements de segment et la stabilité des élasticités d'un réentraînement à l'autre.
+
+### 8.3 Risques scientifiques
+
+| Risque | Effet | Parade |
+| --- | --- | --- |
+| Peu de variation de prix exogène | Élasticités imprécises | Agrégation, mutualisation, intervalles publiés ; à défaut, tests de prix randomisés par cluster de magasins proposés à ADEO |
+| Ruptures non tracées | Demande et substitution biaisées | Reconstitution à partir des stocks ; familles pilotes bien tracées |
+| Historique de prix concurrents partiel | Indice de compétitivité inexploitable | Feature optionnelle, go / no-go en fin de cadrage |
+| Knowledge graph sans taux d'attachement | Lot 3 sans paramètres | Taux recalculés sur les tickets |
+| Taille de marché du nested logit non observée | Élasticités croisées sensibles à l'hypothèse | Analyse de sensibilité ; repli sur le modèle log-log contraint |
+| Sélection sur une métrique de type L1 | Retour du biais vers zéro | Biais et RMSSE dans les critères d'acceptation |
+
+### 8.4 Questions de cadrage
+
+- Accès au code, aux métriques et à la raison d'être du plancher du moteur actuel ?
+- Que recouvre « LightGBM dual » ?
+- Granularité, horizons et consommateurs de la sortie ?
+- Profondeur et couverture de l'historique de prix concurrents ?
+- Contenu du knowledge graph : liens seuls ou taux d'attachement ?
+- Accès aux tickets de caisse et traçabilité des ruptures ?
